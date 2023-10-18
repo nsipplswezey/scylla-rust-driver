@@ -1,4 +1,5 @@
 <img src="assets/monster+rust.png" height="150" align="right">
+<img src="assets/monster+rust.png" height="150" align="right">
 
 # ScyllaDB Rust Driver
 
