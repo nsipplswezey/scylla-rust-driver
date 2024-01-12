@@ -1,5 +1,4 @@
 use crate::batch::{Batch, BatchStatement};
-use crate::frame::value::{BatchValues, ValueList};
 use crate::prepared_statement::PreparedStatement;
 use crate::query::Query;
 use crate::transport::errors::QueryError;
@@ -10,6 +9,8 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::future::try_join_all;
 use scylla_cql::frame::response::result::PreparedMetadata;
+use scylla_cql::types::serialize::batch::BatchValues;
+use scylla_cql::types::serialize::row::SerializeRow;
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 
@@ -70,38 +71,35 @@ where
     pub async fn execute(
         &self,
         query: impl Into<Query>,
-        values: impl ValueList,
+        values: impl SerializeRow,
     ) -> Result<QueryResult, QueryError> {
         let query = query.into();
         let prepared = self.add_prepared_statement_owned(query).await?;
-        let values = values.serialized()?;
-        self.session.execute(&prepared, values.clone()).await
+        self.session.execute(&prepared, values).await
     }
 
     /// Does the same thing as [`Session::execute_iter`] but uses the prepared statement cache
     pub async fn execute_iter(
         &self,
         query: impl Into<Query>,
-        values: impl ValueList,
+        values: impl SerializeRow,
     ) -> Result<RowIterator, QueryError> {
         let query = query.into();
         let prepared = self.add_prepared_statement_owned(query).await?;
-        let values = values.serialized()?;
-        self.session.execute_iter(prepared, values.clone()).await
+        self.session.execute_iter(prepared, values).await
     }
 
     /// Does the same thing as [`Session::execute_paged`] but uses the prepared statement cache
     pub async fn execute_paged(
         &self,
         query: impl Into<Query>,
-        values: impl ValueList,
+        values: impl SerializeRow,
         paging_state: Option<Bytes>,
     ) -> Result<QueryResult, QueryError> {
         let query = query.into();
         let prepared = self.add_prepared_statement_owned(query).await?;
-        let values = values.serialized()?;
         self.session
-            .execute_paged(&prepared, values.clone(), paging_state.clone())
+            .execute_paged(&prepared, values, paging_state.clone())
             .await
     }
 
@@ -381,7 +379,7 @@ mod tests {
         for expected_row in expected_rows.iter() {
             if !selected_rows.contains(expected_row) {
                 panic!(
-                    "Expected {:?} to contain row: {:?}, but they didnt",
+                    "Expected {:?} to contain row: {:?}, but they didn't",
                     selected_rows, expected_row
                 );
             }

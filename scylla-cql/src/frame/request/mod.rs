@@ -7,8 +7,9 @@ pub mod query;
 pub mod register;
 pub mod startup;
 
+use crate::types::serialize::row::SerializedValues;
 use crate::{frame::frame_errors::ParseError, Consistency};
-use bytes::{BufMut, Bytes};
+use bytes::Bytes;
 use num_enum::TryFromPrimitive;
 
 pub use auth_response::AuthResponse;
@@ -22,7 +23,6 @@ pub use startup::Startup;
 use self::batch::BatchStatement;
 
 use super::types::SerialConsistency;
-use super::value::SerializedValues;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, TryFromPrimitive)]
 #[repr(u8)]
@@ -40,7 +40,7 @@ pub enum RequestOpcode {
 pub trait SerializableRequest {
     const OPCODE: RequestOpcode;
 
-    fn serialize(&self, buf: &mut impl BufMut) -> Result<(), ParseError>;
+    fn serialize(&self, buf: &mut Vec<u8>) -> Result<(), ParseError>;
 
     fn to_bytes(&self) -> Result<Bytes, ParseError> {
         let mut v = Vec::new();
@@ -112,9 +112,10 @@ mod tests {
                 query::{Query, QueryParameters},
                 DeserializableRequest, SerializableRequest,
             },
+            response::result::ColumnType,
             types::{self, SerialConsistency},
-            value::SerializedValues,
         },
+        types::serialize::row::SerializedValues,
         Consistency,
     };
 
@@ -130,7 +131,7 @@ mod tests {
             paging_state: Some(vec![2, 1, 3, 7].into()),
             values: {
                 let mut vals = SerializedValues::new();
-                vals.add_value(&2137).unwrap();
+                vals.add_value(&2137, &ColumnType::Int).unwrap();
                 Cow::Owned(vals)
             },
         };
@@ -157,8 +158,8 @@ mod tests {
             paging_state: None,
             values: {
                 let mut vals = SerializedValues::new();
-                vals.add_named_value("the_answer", &42).unwrap();
-                vals.add_named_value("really?", &2137).unwrap();
+                vals.add_value(&42, &ColumnType::Int).unwrap();
+                vals.add_value(&2137, &ColumnType::Int).unwrap();
                 Cow::Owned(vals)
             },
         };
@@ -212,7 +213,7 @@ mod tests {
             timestamp: None,
             page_size: None,
             paging_state: None,
-            values: Cow::Owned(SerializedValues::new()),
+            values: Cow::Borrowed(SerializedValues::EMPTY),
         };
         let query = Query {
             contents: contents.clone(),

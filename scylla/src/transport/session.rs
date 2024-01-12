@@ -1,6 +1,7 @@
 //! `Session` is the main object used in the driver.\
 //! It manages all connections to the cluster and allows to perform queries.
 
+use crate::batch::batch_values;
 #[cfg(feature = "cloud")]
 use crate::cloud::CloudConfig;
 
@@ -16,6 +17,8 @@ use itertools::{Either, Itertools};
 pub use scylla_cql::errors::TranslationError;
 use scylla_cql::frame::response::result::{deser_cql_value, ColumnSpec, Rows};
 use scylla_cql::frame::response::NonErrorResponse;
+use scylla_cql::types::serialize::batch::BatchValues;
+use scylla_cql::types::serialize::row::SerializeRow;
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -46,9 +49,6 @@ use super::NodeRef;
 use crate::cql_to_rust::FromRow;
 use crate::frame::response::cql_to_rust::FromRowError;
 use crate::frame::response::result;
-use crate::frame::value::{
-    BatchValues, BatchValuesFirstSerialized, BatchValuesIterator, ValueList,
-};
 use crate::prepared_statement::PreparedStatement;
 use crate::query::Query;
 use crate::routing::Token;
@@ -116,7 +116,7 @@ impl AddressTranslator for HashMap<SocketAddr, SocketAddr> {
 }
 
 #[async_trait]
-// Notice: this is unefficient, but what else can we do with such poor representation as str?
+// Notice: this is inefficient, but what else can we do with such poor representation as str?
 // After all, the cluster size is small enough to make this irrelevant.
 impl AddressTranslator for HashMap<&'static str, &'static str> {
     async fn translate_address(
@@ -444,7 +444,7 @@ pub(crate) enum RunQueryResult<ResT> {
 /// Represents a CQL session, which can be used to communicate
 /// with the database
 impl Session {
-    /// Estabilishes a CQL session with the database
+    /// Establishes a CQL session with the database
     ///
     /// Usually it's easier to use [SessionBuilder](crate::transport::session_builder::SessionBuilder)
     /// instead of calling `Session::connect` directly, because it's more convenient.
@@ -559,6 +559,10 @@ impl Session {
     ///
     /// This is the easiest way to make a query, but performance is worse than that of prepared queries.
     ///
+    /// It is discouraged to use this method with non-empty values argument (`is_empty()` method from `SerializeRow`
+    /// trait returns false). In such case, query first needs to be prepared (on a single connection), so
+    /// driver will perform 2 round trips instead of 1. Please use [`Session::execute()`] instead.
+    ///
     /// See [the book](https://rust-driver.docs.scylladb.com/stable/queries/simple.html) for more information
     /// # Arguments
     /// * `query` - query to perform, can be just a `&str` or the [Query] struct.
@@ -603,12 +607,17 @@ impl Session {
     pub async fn query(
         &self,
         query: impl Into<Query>,
-        values: impl ValueList,
+        values: impl SerializeRow,
     ) -> Result<QueryResult, QueryError> {
         self.query_paged(query, values, None).await
     }
 
     /// Queries the database with a custom paging state.
+    ///
+    /// It is discouraged to use this method with non-empty values argument (`is_empty()` method from `SerializeRow`
+    /// trait returns false). In such case, query first needs to be prepared (on a single connection), so
+    /// driver will perform 2 round trips instead of 1. Please use [`Session::execute_paged()`] instead.
+    ///
     /// # Arguments
     ///
     /// * `query` - query to be performed
@@ -617,11 +626,10 @@ impl Session {
     pub async fn query_paged(
         &self,
         query: impl Into<Query>,
-        values: impl ValueList,
+        values: impl SerializeRow,
         paging_state: Option<Bytes>,
     ) -> Result<QueryResult, QueryError> {
         let query: Query = query.into();
-        let serialized_values = values.serialized()?;
 
         let execution_profile = query
             .get_execution_profile_handle()
@@ -640,7 +648,8 @@ impl Session {
             ..Default::default()
         };
 
-        let span = RequestSpan::new_query(&query.contents, serialized_values.size());
+        let span = RequestSpan::new_query(&query.contents);
+        let span_ref = &span;
         let run_query_result = self
             .run_query(
                 statement_info,
@@ -656,19 +665,35 @@ impl Session {
                         .unwrap_or(execution_profile.serial_consistency);
                     // Needed to avoid moving query and values into async move block
                     let query_ref = &query;
-                    let values_ref = &serialized_values;
+                    let values_ref = &values;
                     let paging_state_ref = &paging_state;
                     async move {
-                        connection
-                            .query_with_consistency(
-                                query_ref,
-                                values_ref,
-                                consistency,
-                                serial_consistency,
-                                paging_state_ref.clone(),
-                            )
-                            .await
-                            .and_then(QueryResponse::into_non_error_query_response)
+                        if values_ref.is_empty() {
+                            span_ref.record_request_size(0);
+                            connection
+                                .query_with_consistency(
+                                    query_ref,
+                                    consistency,
+                                    serial_consistency,
+                                    paging_state_ref.clone(),
+                                )
+                                .await
+                                .and_then(QueryResponse::into_non_error_query_response)
+                        } else {
+                            let prepared = connection.prepare(query_ref).await?;
+                            let serialized = prepared.serialize_values(values_ref)?;
+                            span_ref.record_request_size(serialized.buffer_size());
+                            connection
+                                .execute_with_consistency(
+                                    &prepared,
+                                    &serialized,
+                                    consistency,
+                                    serial_consistency,
+                                    paging_state_ref.clone(),
+                                )
+                                .await
+                                .and_then(QueryResponse::into_non_error_query_response)
+                        }
                     }
                 },
                 &span,
@@ -734,6 +759,10 @@ impl Session {
     /// Returns an async iterator (stream) over all received rows\
     /// Page size can be specified in the [Query] passed to the function
     ///
+    /// It is discouraged to use this method with non-empty values argument (`is_empty()` method from `SerializeRow`
+    /// trait returns false). In such case, query first needs to be prepared (on a single connection), so
+    /// driver will initially perform 2 round trips instead of 1. Please use [`Session::execute_iter()`] instead.
+    ///
     /// See [the book](https://rust-driver.docs.scylladb.com/stable/queries/paged.html) for more information
     ///
     /// # Arguments
@@ -764,24 +793,38 @@ impl Session {
     pub async fn query_iter(
         &self,
         query: impl Into<Query>,
-        values: impl ValueList,
+        values: impl SerializeRow,
     ) -> Result<RowIterator, QueryError> {
         let query: Query = query.into();
-        let serialized_values = values.serialized()?;
 
         let execution_profile = query
             .get_execution_profile_handle()
             .unwrap_or_else(|| self.get_default_execution_profile_handle())
             .access();
 
-        RowIterator::new_for_query(
-            query,
-            serialized_values.into_owned(),
-            execution_profile,
-            self.cluster.get_data(),
-            self.metrics.clone(),
-        )
-        .await
+        if values.is_empty() {
+            RowIterator::new_for_query(
+                query,
+                execution_profile,
+                self.cluster.get_data(),
+                self.metrics.clone(),
+            )
+            .await
+        } else {
+            // Making RowIterator::new_for_query work with values is too hard (if even possible)
+            // so instead of sending one prepare to a specific connection on each iterator query,
+            // we fully prepare a statement beforehand.
+            let prepared = self.prepare(query).await?;
+            let values = prepared.serialize_values(&values)?;
+            RowIterator::new_for_prepared_statement(PreparedIteratorConfig {
+                prepared,
+                values,
+                execution_profile,
+                cluster_data: self.cluster.get_data(),
+                metrics: self.metrics.clone(),
+            })
+            .await
+        }
     }
 
     /// Prepares a statement on the server side and returns a prepared statement,
@@ -916,7 +959,7 @@ impl Session {
     pub async fn execute(
         &self,
         prepared: &PreparedStatement,
-        values: impl ValueList,
+        values: impl SerializeRow,
     ) -> Result<QueryResult, QueryError> {
         self.execute_paged(prepared, values, None).await
     }
@@ -930,18 +973,15 @@ impl Session {
     pub async fn execute_paged(
         &self,
         prepared: &PreparedStatement,
-        values: impl ValueList,
+        values: impl SerializeRow,
         paging_state: Option<Bytes>,
     ) -> Result<QueryResult, QueryError> {
-        let serialized_values = values.serialized()?;
+        let serialized_values = prepared.serialize_values(&values)?;
         let values_ref = &serialized_values;
         let paging_state_ref = &paging_state;
 
         let (partition_key, token) = prepared
-            .extract_partition_key_and_calculate_token(
-                prepared.get_partitioner_name(),
-                &serialized_values,
-            )?
+            .extract_partition_key_and_calculate_token(prepared.get_partitioner_name(), values_ref)?
             .unzip();
 
         let execution_profile = prepared
@@ -966,7 +1006,7 @@ impl Session {
         let span = RequestSpan::new_prepared(
             partition_key.as_ref().map(|pk| pk.iter()),
             token,
-            serialized_values.size(),
+            serialized_values.buffer_size(),
         );
 
         if !span.span().is_disabled() {
@@ -1076,10 +1116,10 @@ impl Session {
     pub async fn execute_iter(
         &self,
         prepared: impl Into<PreparedStatement>,
-        values: impl ValueList,
+        values: impl SerializeRow,
     ) -> Result<RowIterator, QueryError> {
         let prepared = prepared.into();
-        let serialized_values = values.serialized()?;
+        let serialized_values = prepared.serialize_values(&values)?;
 
         let execution_profile = prepared
             .get_execution_profile_handle()
@@ -1088,7 +1128,7 @@ impl Session {
 
         RowIterator::new_for_prepared_statement(PreparedIteratorConfig {
             prepared,
-            values: serialized_values.into_owned(),
+            values: serialized_values,
             execution_profile,
             cluster_data: self.cluster.get_data(),
             metrics: self.metrics.clone(),
@@ -1101,6 +1141,11 @@ impl Session {
     /// Batch doesn't return any rows
     ///
     /// Batch values must contain values for each of the queries
+    ///
+    /// Avoid using non-empty values (`SerializeRow::is_empty()` return false) for simple queries
+    /// inside the batch. Such queries will first need to be prepared, so the driver will need to
+    /// send (numer_of_unprepared_queries_with_values + 1) requests instead of 1 request, severly
+    /// affecting performance.
     ///
     /// See [the book](https://rust-driver.docs.scylladb.com/stable/queries/batch.html) for more information
     ///
@@ -1151,9 +1196,6 @@ impl Session {
                 BadQuery::TooManyQueriesInBatchStatement(batch_statements_length),
             ));
         }
-        // Extract first serialized_value
-        let first_serialized_value = values.batch_values_iter().next_serialized().transpose()?;
-        let first_serialized_value = first_serialized_value.as_deref();
 
         let execution_profile = batch
             .get_execution_profile_handle()
@@ -1170,28 +1212,22 @@ impl Session {
             .serial_consistency
             .unwrap_or(execution_profile.serial_consistency);
 
-        let statement_info = match (first_serialized_value, batch.statements.first()) {
-            (Some(first_serialized_value), Some(BatchStatement::PreparedStatement(ps))) => {
-                RoutingInfo {
-                    consistency,
-                    serial_consistency,
-                    token: ps.calculate_token(first_serialized_value)?,
-                    keyspace: ps.get_keyspace_name(),
-                    is_confirmed_lwt: false,
-                }
-            }
-            _ => RoutingInfo {
-                consistency,
-                serial_consistency,
-                ..Default::default()
-            },
+        let keyspace_name = match batch.statements.first() {
+            Some(BatchStatement::PreparedStatement(ps)) => ps.get_keyspace_name(),
+            _ => None,
         };
-        let first_value_token = statement_info.token;
 
-        // Reuse first serialized value when serializing query, and delegate to `BatchValues::write_next_to_request`
-        // directly for others (if they weren't already serialized, possibly don't even allocate the `SerializedValues`)
-        let values = BatchValuesFirstSerialized::new(&values, first_serialized_value);
+        let (first_value_token, values) =
+            batch_values::peek_first_token(values, batch.statements.first())?;
         let values_ref = &values;
+
+        let statement_info = RoutingInfo {
+            consistency,
+            serial_consistency,
+            token: first_value_token,
+            keyspace: keyspace_name,
+            is_confirmed_lwt: false,
+        };
 
         let span = RequestSpan::new_batch();
 
@@ -1891,7 +1927,7 @@ pub(crate) struct RequestSpan {
 }
 
 impl RequestSpan {
-    pub(crate) fn new_query(contents: &str, request_size: usize) -> Self {
+    pub(crate) fn new_query(contents: &str) -> Self {
         use tracing::field::Empty;
 
         let span = trace_span!(
@@ -1899,7 +1935,7 @@ impl RequestSpan {
             kind = "unprepared",
             contents = contents,
             //
-            request_size = request_size,
+            request_size = Empty,
             result_size = Empty,
             result_rows = Empty,
             replicas = Empty,
@@ -2011,6 +2047,10 @@ impl RequestSpan {
         }
         self.span
             .record("replicas", tracing::field::display(&ReplicaIps(replicas)));
+    }
+
+    pub(crate) fn record_request_size(&self, size: usize) {
+        self.span.record("request_size", size);
     }
 
     pub(crate) fn inc_speculative_executions(&self) {
