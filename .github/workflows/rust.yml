@@ -73,4 +73,4 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Compile docs
-      run: RUSTDOCFLAGS=-Dwarnings cargo doc
+      run: RUSTDOCFLAGS="-D warnings" cargo doc
